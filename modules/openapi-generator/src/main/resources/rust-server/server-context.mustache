@@ -4,11 +4,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::default::Default;
 use futures::FutureExt;
+use headers::{ContentType, HeaderMapExt};
 use hyper;
 use hyper::{Request, Response, Error, StatusCode};
 use url::form_urlencoded;
-use swagger::auth::{Authorization, AuthData, Scopes};
-use swagger::{Has, Pop, Push, XSpanIdString};
+use openapi_context::auth::{Authorization, AuthData, Scopes};
+use openapi_context::{Has, Pop, Push, XSpanIdString};
 use crate::Api;
 
 pub struct NewAddContext<T, A>
@@ -22,7 +23,7 @@ impl<T, A, B, C, D> NewAddContext<T, A>
         A: Default + Push<XSpanIdString, Result=B>,
         B: Push<Option<AuthData>, Result=C>,
         C: Push<Option<Authorization>, Result=D>,
-        T: hyper::service::NewService<Request = (Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error> + 'static,
+        T: hyper::service::Service<(Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error> + 'static,
 {
     pub fn new(inner: T) -> NewAddContext<T, A> {
         NewAddContext {
@@ -32,25 +33,23 @@ impl<T, A, B, C, D> NewAddContext<T, A>
     }
 }
 
-impl<T, A, B, C, D> hyper::service::MakeService<NewAddContext<T, A>, hyper::Body> for NewAddContext<T, A>
+impl<T, A, B, C, D> hyper::service::Service<NewAddContext<T, A>> for NewAddContext<T, A>
     where
         A: Default + Push<XSpanIdString, Result=B>,
         B: Push<Option<AuthData>, Result=C>,
         C: Push<Option<Authorization>, Result=D>,
-        T: hyper::service::NewService<Request = (Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error> + 'static,
+        T: hyper::service::Service<(Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error> + 'static,
 {
-    type ResBody = hyper::Body;
+    type Response = Self;
     type Error = Error;
-    type Service = Self;
-    type Future = Pin<Box<dyn Future<Output=Result<Self::Service, Self::MakeError>>>>;
-    type MakeError = Error;
+    type Future = futures::future::Ready<Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::MakeError>> {
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn make_service(&mut self, target: NewAddContext<T, A>) -> Self::Future {
-        futures::future::ready(self.inner.new_service().map(|s| AddContext::new(s))).boxed()
+    fn call(&mut self, target: NewAddContext<T, A>) -> Self::Future {
+        futures::future::ready(self.inner.new_service().map(|s| AddContext::new(s)))
     }
 }
 
@@ -66,7 +65,7 @@ impl<T, A, B, C, D> AddContext<T, A>
         A: Default + Push<XSpanIdString, Result=B>,
         B: Push<Option<AuthData>, Result=C>,
         C: Push<Option<Authorization>, Result=D>,
-        T: hyper::service::Service<Request = (Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error>,
+        T: hyper::service::Service<(Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error>,
 {
     pub fn new(inner: T) -> AddContext<T, A> {
         AddContext {
@@ -76,27 +75,31 @@ impl<T, A, B, C, D> AddContext<T, A>
     }
 }
 
-impl<T, A, B, C, D> hyper::server::Service for AddContext<T, A>
+impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext<T, A>
     where
         A: Default + Push<XSpanIdString, Result=B>,
         B: Push<Option<AuthData>, Result=C>,
         C: Push<Option<Authorization>, Result=D>,
-        T: hyper::service::Service<Request = (Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error>,
+        T: hyper::service::Service<(Request<hyper::Body>, D), Response = Response<hyper::Body>, Error = Error>,
 {
-    type Request = Request;
-    type Response = Response;
+    type Response = Response<hyper::Body>;
     type Error = Error;
     type Future = T::Future;
 
-    fn call(&self, req: Self::Request) -> Self::Future {
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&self, req: Request<hyper::Body>) -> Self::Future {
         let context = A::default().push(XSpanIdString::get_or_generate(&req));
 
         {{#authMethods}}
         {{#isBasic}}
         {
-            use hyper::header::{Authorization as HyperAuth, Basic, Bearer};
+            use headers::{Authorization as HyperAuth};
+            use headers::authorization::Basic;
             use std::ops::Deref;
-            if let Some(basic) = req.headers().get::<HyperAuth<Basic>>().cloned() {
+            if let Some(basic) = req.headers().get_typed::<HyperAuth<Basic>>().cloned() {
                 let auth_data = AuthData::Basic(basic.deref().clone());
                 let context = context.push(Some(auth_data));
                 let context = context.push(None::<Authorization>);
@@ -106,9 +109,10 @@ impl<T, A, B, C, D> hyper::server::Service for AddContext<T, A>
         {{/isBasic}}
         {{#isOAuth}}
         {
-            use hyper::header::{Authorization as HyperAuth, Basic, Bearer};
+            use headers::{Authorization as HyperAuth};
+            use headers::authorization::Bearer;
             use std::ops::Deref;
-            if let Some(bearer) = req.headers().get::<HyperAuth<Bearer>>().cloned() {
+            if let Some(bearer) = req.headers().get_typed::<HyperAuth<Bearer>>().cloned() {
                 let auth_data = AuthData::Bearer(bearer.deref().clone());
                 let context = context.push(Some(auth_data));
                 let context = context.push(None::<Authorization>);
@@ -119,8 +123,7 @@ impl<T, A, B, C, D> hyper::server::Service for AddContext<T, A>
         {{#isApiKey}}
         {{#isKeyInHeader}}
         {
-            header! { (ApiKey{{-index}}, "{{{keyParamName}}}") => [String] }
-            if let Some(header) = req.headers().get::<ApiKey{{-index}}>().cloned() {
+            if let Some(header) = req.headers().get_typed::<ApiKey{{-index}}>().cloned() {
                 let auth_data = AuthData::ApiKey(header.0);
                 let context = context.push(Some(auth_data));
                 let context = context.push(None::<Authorization>);

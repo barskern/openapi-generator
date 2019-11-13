@@ -63,7 +63,7 @@ public class RustServerCodegen extends DefaultCodegen implements CodegenConfig {
     protected Map<String, Map<String, String>> pathSetMap = new HashMap<String, Map<String, String>>();
 
     private static final String uuidType = "uuid::Uuid";
-    private static final String bytesType = "swagger::ByteArray";
+    private static final String bytesType = "openapi_context::ByteArray";
 
     public RustServerCodegen() {
         super();
@@ -635,7 +635,7 @@ public class RustServerCodegen extends DefaultCodegen implements CodegenConfig {
             rsp.vendorExtensions.put("x-uppercaseResponseId", underscore(responseId).toUpperCase(Locale.ROOT));
             rsp.vendorExtensions.put("uppercase_operation_id", underscore(op.operationId).toUpperCase(Locale.ROOT));
             if (rsp.dataType != null) {
-                rsp.vendorExtensions.put("uppercase_data_type", (rsp.dataType.replace("models::", "")).toUpperCase(Locale.ROOT));
+                rsp.vendorExtensions.put("uppercase_data_type", (rsp.dataType.replace("crate::models::", "")).toUpperCase(Locale.ROOT));
 
                 // Default to producing json if nothing else is specified
                 if (producesXml) {
@@ -832,7 +832,7 @@ public class RustServerCodegen extends DefaultCodegen implements CodegenConfig {
 
                 if (datatype.indexOf("#/components/schemas/") == 0) {
                     datatype = toModelName(datatype.substring("#/components/schemas/".length()));
-                    datatype = "models::" + datatype;
+                    datatype = "crate::models::" + datatype;
                 }
             } catch (Exception e) {
                 LOGGER.warn("Error obtaining the datatype from schema (model):" + p + ". Datatype default to Object");
@@ -897,7 +897,7 @@ public class RustServerCodegen extends DefaultCodegen implements CodegenConfig {
             // xml name so we can insert it into the relevant model fields.
             if (xmlName != null) {
                 mdl.vendorExtensions.put("itemXmlName", xmlName);
-                modelXmlNames.put("models::" + mdl.classname, xmlName);
+                modelXmlNames.put("crate::models::" + mdl.classname, xmlName);
             }
 
             mdl.arrayModelType = toModelName(mdl.arrayModelType);
@@ -1177,7 +1177,7 @@ public class RustServerCodegen extends DefaultCodegen implements CodegenConfig {
             if ((param.isByteArray) || (param.isBinary)) {
                 // Binary primitive types don't implement `Display`.
                 param.vendorExtensions.put("formatString", "{:?}");
-                example = "swagger::ByteArray(Vec::from(\"" + ((param.example != null) ? param.example : "") + "\"))";
+                example = bytesType + "(Vec::from(\"" + ((param.example != null) ? param.example : "") + "\"))";
             } else {
                 param.vendorExtensions.put("formatString", "{}");
                 example = (param.example != null) ? param.example : "";

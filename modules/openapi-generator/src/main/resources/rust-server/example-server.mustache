@@ -7,8 +7,8 @@ use openssl::error::ErrorStack;
 use hyper::server::Http;
 use tokio_proto::TcpServer;
 use clap::{App, Arg};
-use swagger::auth::AllowAllAuthenticator;
-use swagger::EmptyContext;
+use openapi_context::auth::AllowAllAuthenticator;
+use openapi_context::EmptyContext;
 
 mod server_lib;
 

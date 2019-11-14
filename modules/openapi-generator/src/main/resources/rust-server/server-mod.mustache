@@ -171,9 +171,8 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             {{#-first}}
             // Header parameters
             {{/-first}}
-            //header! { (Request{{vendorExtensions.typeName}}, "{{{baseName}}}") => {{#isListContainer}}({{{baseType}}})*{{/isListContainer}}{{^isListContainer}}[{{{dataType}}}]{{/isListContainer}} }
             {{#required}}
-            let param_{{{paramName}}} = match headers.typed_get::<Request{{vendorExtensions.typeName}}>("{{{baseName}}}") {
+            let param_{{{paramName}}} = match headers.typed_get(Request{{vendorExtensions.typeName}}) {
                 Some(param_{{{paramName}}}) => param_{{{paramName}}}.0.clone(),
                 None => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from("Missing or invalid required header {{{baseName}}}"))).unwrap()),
             };
@@ -398,12 +397,11 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 => {
                     response.status(hyper::http::StatusCode::from_u16({{{code}}}).unwrap());
             {{#headers}}
-                    //header! { (Response{{{nameInCamelCase}}}, "{{{baseName}}}") => [{{{dataType}}}] }
-                    response.headers().typed_insert("{{{baseName}}}", Response{{{nameInCamelCase}}}({{{name}}}));
-                    //response.header(Response{{{nameInCamelCase}}}({{{name}}}));
+                    response.headers().typed_insert(Response{{{nameInCamelCase}}}({{{name}}}));
             {{/headers}}
             {{#produces}}{{#-first}}{{#dataType}}
-                    response.header(hyper::header::CONTENT_TYPE, mimetypes::responses::{{#vendorExtensions}}{{{uppercase_operation_id}}}_{{x-uppercaseResponseId}}{{/vendorExtensions}}.clone());
+                    let header = headers::ContentType::from(mimetypes::responses::{{#vendorExtensions}}{{{uppercase_operation_id}}}_{{x-uppercaseResponseId}}{{/vendorExtensions}}.clone());
+                    response.header(header);
             {{/dataType}}{{/-first}}{{/produces}}
             {{#dataType}}
                 {{#vendorExtensions}}{{#producesXml}}{{^has_namespace}}

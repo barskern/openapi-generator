@@ -262,12 +262,7 @@ impl<F, C> Api<C> for Client<F> where
             {{#isApiKey}}
                 {{#isKeyInHeader}}
                     &AuthData::ApiKey(ref api_key) => {
-                        //header! { ({{#vendorExtensions}}{{x-apiKeyName}}{{/vendorExtensions}}, "{{keyParamName}}") => [String] }
-                        //request.header(
-                        //    {{#vendorExtensions}}{{x-apiKeyName}}{{/vendorExtensions}}(api_key.to_string())
-                        //)
                         request.headers_mut().unwrap().typed_insert(
-                            "{{keyParamName}}",
                             {{#vendorExtensions}}{{x-apiKeyName}}{{/vendorExtensions}}(api_key.to_string())
                         )
                     },
@@ -306,9 +301,9 @@ impl<F, C> Api<C> for Client<F> where
         {{#-first}}
 
             // Header parameters
-        {{/-first}}{{^isMapContainer}}        //header! { (Request{{vendorExtensions.typeName}}, "{{{baseName}}}") => {{#isListContainer}}({{{baseType}}})*{{/isListContainer}}{{^isListContainer}}[{{{dataType}}}]{{/isListContainer}} }
-        {{#required}}        request.headers_mut().unwrap().typed_set("{{{baseName}}}", Request{{vendorExtensions.typeName}}(param_{{{paramName}}}{{#isListContainer}}.clone(){{/isListContainer}}));
-        {{/required}}{{^required}}        param_{{{paramName}}}.map(|header| request.headers().typed_set("{{{baseName}}}", Request{{vendorExtensions.typeName}}(header{{#isListContainer}}.clone(){{/isListContainer}})));
+        {{/-first}}{{^isMapContainer}}
+        {{#required}}        request.headers_mut().unwrap().typed_set(Request{{vendorExtensions.typeName}}(param_{{{paramName}}}{{#isListContainer}}.clone(){{/isListContainer}}));
+        {{/required}}{{^required}}        param_{{{paramName}}}.map(|header| request.headers().typed_set(Request{{vendorExtensions.typeName}}(header{{#isListContainer}}.clone(){{/isListContainer}})));
         {{/required}}{{/isMapContainer}}{{#isMapContainer}}                let param_{{{paramName}}}: Option<{{{dataType}}}> = None;
     {{/isMapContainer}}
     {{/headerParams}}
@@ -449,7 +444,7 @@ impl<F, C> Api<C> for Client<F> where
         match response.status().as_u16() {
 {{#responses}}
             {{{code}}} => {
-{{#headers}}                header! { (Response{{{nameInCamelCase}}}, "{{{baseName}}}") => [{{{datatype}}}] }
+{{#headers}}
                 let response_{{{name}}} = match response.headers().get::<Response{{{nameInCamelCase}}}>() {
                     Some(response_{{{name}}}) => response_{{{name}}}.0.clone(),
                     None => return Err(ApiError(String::from("Required response header {{{baseName}}} for response {{{code}}} was not found."))),

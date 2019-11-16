@@ -1,3 +1,4 @@
+use crate::headers::*;
 use std::io;
 use std::marker::PhantomData;
 use std::future::Future;
@@ -96,7 +97,7 @@ impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext
         {{#authMethods}}
         {{#isBasic}}
         {
-            use headers::{Authorization as HyperAuth};
+            use headers::Authorization as HyperAuth;
             use headers::authorization::Basic;
             use std::ops::Deref;
             if let Some(basic) = req.headers().get_typed::<HyperAuth<Basic>>().cloned() {
@@ -109,7 +110,7 @@ impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext
         {{/isBasic}}
         {{#isOAuth}}
         {
-            use headers::{Authorization as HyperAuth};
+            use headers::Authorization as HyperAuth;
             use headers::authorization::Bearer;
             use std::ops::Deref;
             if let Some(bearer) = req.headers().get_typed::<HyperAuth<Bearer>>().cloned() {

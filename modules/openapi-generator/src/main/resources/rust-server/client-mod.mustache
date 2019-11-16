@@ -1,4 +1,4 @@
-use crate::models;
+use crate::{models, headers::*};
 use async_trait::async_trait;
 use headers::HeaderMapExt;
 use hyper;
@@ -29,7 +29,7 @@ use serde_xml_rs;
 #[allow(unused_imports)]
 use std::collections::{HashMap, BTreeMap};
 
-use openapi_context::{ApiError, X_SPAN_ID, XSpanIdString, Has, AuthData, AuthData::ApiKey};
+use openapi_context::{ApiError, X_SPAN_ID, XSpanIdString, Has, AuthData};
 
 use crate::{
     Api
@@ -74,7 +74,7 @@ fn into_base_path(input: &str, correct_scheme: Option<&'static str>) -> Result<S
 /// A client that implements the API by making HTTP calls out to a server.
 pub struct Client<F> where
   F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + 'static {
-    client_service: Arc<Box<dyn hyper::client::service::Service<hyper::Request<hyper::Body>, Response=hyper::Response<hyper::Body>, Error=hyper::Error, Future=F>>>,
+    client_service: Arc<Box<dyn hyper::service::Service<hyper::Request<hyper::Body>, Response=hyper::Response<hyper::Body>, Error=hyper::Error, Future=F>>>,
     base_path: String,
 }
 
@@ -187,7 +187,7 @@ impl Client<hyper::client::ResponseFuture> {
         connector_fn: Box<dyn Fn() -> C + Send + Sync>,
     ) -> Result<Client<hyper::client::ResponseFuture>, ClientInitError>
     where
-        C: hyper::client::Connect + hyper::service::Service<hyper::Request<hyper::Body>>,
+        C: hyper::service::Service<hyper::client::connect::Destination>,
     {
         let connector = connector_fn();
         let client_service = Box::new(hyper::Client::builder().build(connector));
@@ -205,7 +205,7 @@ impl<F> Client<F> where
     /// Constructor for creating a `Client` by passing in a pre-made `hyper` client Service.
     ///
     /// This allows adding custom wrappers around the underlying transport, for example for logging.
-    pub fn try_new_with_client_service(client_service: Arc<Box<dyn hyper::client::service::Service<hyper::Request<hyper::Body>, Response=hyper::Response<hyper::Body>, Error=hyper::Error, Future=F>>>,
+    pub fn try_new_with_client_service(client_service: Arc<Box<dyn hyper::service::Service<hyper::Request<hyper::Body>, Response=hyper::Response<hyper::Body>, Error=hyper::Error, Future=F>>>,
                                        base_path: &str)
                                     -> Result<Client<F>, ClientInitError>
     {
@@ -255,46 +255,46 @@ impl<F, C> Api<C> for Client<F> where
 
     {{#vendorExtensions.hasHeaderAuthMethods}}
 
-        (context as &dyn Has<Option<AuthData>>).get().as_ref().map(|auth_data| {
-        // Currently only authentication with Basic, API Key, and Bearer are supported
-        match auth_data {
+        if let Some(auth_data) = (context as &dyn Has<Option<AuthData>>).get().as_ref() {
+            // Currently only authentication with Basic, API Key, and Bearer are supported
+            match auth_data {
         {{#authMethods}}
             {{#isApiKey}}
                 {{#isKeyInHeader}}
-                    &AuthData::ApiKey(ref api_key) => {
-                        request.headers_mut().unwrap().typed_insert(
-                            {{#vendorExtensions}}{{x-apiKeyName}}{{/vendorExtensions}}(api_key.to_string())
-                        )
-                    },
+                &AuthData::ApiKey(ref api_key) => {
+                    request.headers_mut().unwrap().typed_insert(
+                        {{#vendorExtensions}}{{x-apiKeyName}}{{/vendorExtensions}}(api_key.to_string())
+                    )
+                },
                 {{/isKeyInHeader}}
             {{/isApiKey}}
             {{#isBasicBasic}}
                 &AuthData::Basic(ref basic_header) => {
                     request.headers_mut().unwrap().typed_insert(headers::Authorization::basic(
                         basic_header.clone(),
-                    ))
+                    ).map_err(|e| ApiError(format!("Failed to build request: {}", e)))?)
                 },
             {{/isBasicBasic}}
             {{#isBasicBearer}}
                 &AuthData::Bearer(ref bearer_header) => {
                     request.headers_mut().unwrap().typed_insert(headers::Authorization::bearer(
                         &bearer_header.token,
-                    ))
+                    ).map_err(|e| ApiError(format!("Failed to build request: {}", e)))?)
                 },
             {{/isBasicBearer}}
             {{#isOAuth}}
                 {{^isBasicBearer}}
-                    &AuthData::Bearer(ref bearer_header) => {
-                        request.headers().typed_insert(headers::Authorization::bearer(
-                            &bearer_header.token,
-                        ))
-                    },
+                &AuthData::Bearer(ref bearer_header) => {
+                    request.headers_mut().unwrap().typed_insert(headers::Authorization::bearer(
+                        &bearer_header.token,
+                    ).map_err(|e| ApiError(format!("Failed to build request: {}", e)))?)
+                },
                 {{/isBasicBearer}}
             {{/isOAuth}}
         {{/authMethods}}
-        _ => {}
+                _ => {}
+            }
         }
-        });
     {{/vendorExtensions.hasHeaderAuthMethods}}
 
     {{#headerParams}}
@@ -309,16 +309,16 @@ impl<F, C> Api<C> for Client<F> where
     {{/headerParams}}
 
 {{#vendorExtensions}}
-  {{#consumesMultipart}}
+    {{#consumesMultipart}}
         let mut multipart = Multipart::new(); 
 
-    {{#vendorExtensions}}
-      {{#formParams}}
-        {{#-first}}
+        {{#vendorExtensions}}
+            {{#formParams}}
+                {{#-first}}
         // For each parameter, encode as appropriate and add to the multipart body as a stream.
-        {{/-first}}
-        {{^isByteArray}}
-          {{#jsonSchema}}
+                {{/-first}}
+                {{^isByteArray}}
+                    {{#jsonSchema}}
 
         let {{{paramName}}}_str = match serde_json::to_string(&param_{{{paramName}}}) {
             Ok(str) => str,
@@ -333,9 +333,9 @@ impl<F, C> Api<C> for Client<F> where
 
         multipart.add_stream("{{{paramName}}}",  {{{paramName}}}_cursor,  None as Option<&str>, Some({{{paramName}}}_mime));  
 
-          {{/jsonSchema}}
-        {{/isByteArray}}
-        {{#isByteArray}}
+                    {{/jsonSchema}}
+                {{/isByteArray}}
+                {{#isByteArray}}
 
         let {{{paramName}}}_vec = param_{{{paramName}}}.to_vec();
 
@@ -349,11 +349,11 @@ impl<F, C> Api<C> for Client<F> where
         let filename = None as Option<&str> ;
         multipart.add_stream("{{{paramName}}}",  {{{paramName}}}_cursor,  filename, Some({{{paramName}}}_mime));  
 
-        {{/isByteArray}}
-        {{#-last}}
-        {{/-last}}
-      {{/formParams}}
-    {{/vendorExtensions}}
+                {{/isByteArray}}
+                {{#-last}}
+                {{/-last}}
+            {{/formParams}}
+        {{/vendorExtensions}}
 
         let mut fields = match multipart.prepare() {
             Ok(fields) => fields,
@@ -370,9 +370,12 @@ impl<F, C> Api<C> for Client<F> where
         };
 
         request.headers().typed_set(headers::ContentType::from(multipart_header));
-        let request = request.body(hyper::Body::from(body_string)).unwrap();
+        let body = hyper::Body::from(body_string);
 
-  {{/consumesMultipart}}
+    {{/consumesMultipart}}
+    {{^consumesMultipart}}
+        let body = hyper::Body::empty();
+    {{/consumesMultipart}}
 {{/vendorExtensions}}
 {{#vendorExtensions}}
   {{^consumesMultipart}}
@@ -387,7 +390,7 @@ impl<F, C> Api<C> for Client<F> where
         let body = serde_urlencoded::to_string(params).expect("impossible to fail to serialize");
 
         request.headers().typed_set(headers::ContentType::from(mimetypes::requests::{{#vendorExtensions}}{{{uppercase_operation_id}}}{{/vendorExtensions}}.clone()));
-        let request = request.body(hyper::Body::from(body)).unwrap();
+        let body = hyper::Body::from(body);
         {{/-last}}
       {{/formParams}}
     {{/vendorExtensions}}
@@ -426,21 +429,24 @@ impl<F, C> Api<C> for Client<F> where
         {{^required}}
 
         request.header(ContentType::from(mimetypes::requests::{{#vendorExtensions}}{{{uppercase_operation_id}}}{{/vendorExtensions}}.clone()));
-        let request = if let Some(body) = body {
+        let body = if let Some(body) = body {
 {{/required}}
-        request.body(hyper::Body::from(body)).unwrap();
+        let body = hyper::Body::from(body);
 {{^required}}
         } else {
-            request.body(hyper::Body::empty()).unwrap()
+            hyper::Body::empty()
         };
 {{/required}}
+    {{/bodyParam}}
+    {{^bodyParam}}
+        let body = hyper::Body::empty();
     {{/bodyParam}}
   {{/consumesMultipart}}
 {{/vendorExtensions}}
 
-        let request = request.build().map_err(|e| ApiError(format!("Failed to build request: {}", e)))?;
+        let request = request.body(body).map_err(|e| ApiError(format!("Failed to build request: {}", e)))?;
         let mut response = self.client_service.call(request)
-                             .map_err(|e| ApiError(format!("No response received: {}", e))).await;
+                             .map_err(|e| ApiError(format!("No response received: {}", e))).await?;
         match response.status().as_u16() {
 {{#responses}}
             {{{code}}} => {
@@ -450,8 +456,7 @@ impl<F, C> Api<C> for Client<F> where
                     None => return Err(ApiError(String::from("Required response header {{{baseName}}} for response {{{code}}} was not found."))),
                 };
 {{/headers}}
-                let mut body = response.body();
-                let result: Result<Vec<_>, _> = body
+                let result: Result<Vec<_>, _> = crate::body_as_stream(response.body())
                     .try_collect()
                     .await;
                 let body = result.map_err(|e| ApiError(format!("Failed to read response: {}", e)))?;
@@ -491,8 +496,7 @@ impl<F, C> Api<C> for Client<F> where
 {{/responses}}
             code => {
                 let headers = response.headers().clone();
-                let mut body = response.body();
-                let result: Result<Vec<_>, _> = body
+                let result: Result<Vec<_>, _> = crate::body_as_stream(response.body())
                     .take(100)
                     .try_collect()
                     .await;

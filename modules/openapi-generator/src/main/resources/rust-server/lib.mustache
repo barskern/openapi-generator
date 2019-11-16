@@ -1,6 +1,6 @@
 #![allow(missing_docs, trivial_casts, unused_variables, unused_mut, unused_imports, unused_extern_crates, non_camel_case_types)]
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{FutureExt, Stream, StreamExt};
 use openapi_context::ContextWrapper;
 use std::io::Error;
 
@@ -13,6 +13,13 @@ mod mimetypes;
 pub use openapi_context::ApiError;
 pub const BASE_PATH: &'static str = "{{{basePathWithoutHost}}}";
 pub const API_VERSION: &'static str = "{{{appVersion}}}";
+
+fn body_as_stream(body: hyper::Body) -> impl Stream<Item=Result<hyper::Chunk, ApiError>> {
+    futures::stream::iter(body)
+        .and_then(|f| {
+            f.map_err(|e| ApiError(format!("Error getting response: {}", e)))
+        })
+}
 
 {{#apiInfo}}{{#apis}}{{#operations}}{{#operation}}
 #[derive(Debug, PartialEq)]

@@ -1,3 +1,4 @@
+use crate::{mimetypes, headers::*};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -5,11 +6,11 @@ use std::marker::PhantomData;
 use futures::{future, FutureExt, Stream, stream, TryStreamExt};
 use headers::{ContentType, HeaderMapExt};
 use hyper;
-use hyper::{Request, Response, Error, StatusCode};
+use hyper::{Body, Request, Response, Error, StatusCode};
 use lazy_static::lazy_static;
 use log::*;
 use url::form_urlencoded;
-use crate::mimetypes;
+use mime::Mime;
 {{#apiUsesMultipart}}
 use multipart::server::Multipart;
 use multipart::server::save::SaveResult;
@@ -81,14 +82,14 @@ where
     }
 }
 
-pub type ServiceRequest<C> = (hyper::Request<hyper::Body>, C);
-pub type ServiceResponse = hyper::Response<hyper::Body>;
+pub type ServiceRequest<C> = (Request<Body>, C);
+pub type ServiceResponse = Response<Body>;
 impl<T, C> hyper::service::Service<ServiceRequest<C>> for Service<T, C>
 where
     T: Api<C> + Clone + 'static,
     C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<Authorization>>{{/hasAuthMethods}} + 'static
 {
-    type Response = hyper::Body;
+    type Response = Body;
     type Error = Error;
     type Future = Pin<Box<dyn Future<Output=Result<ServiceResponse, Error>>>>;
 
@@ -378,7 +379,7 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 return Ok(response.body(hyper::Body::from("An internal error occurred")).unwrap());
             });
         {{/consumesPlainText}}{{/vendorExtensions}}{{/bodyParams}}
-            match rsp {
+            match result {
         {{#responses}}
                 {{{operationId}}}Response::{{#vendorExtensions}}{{x-responseId}}{{/vendorExtensions}}{{#dataType}}{{^headers}}(body){{/headers}}{{#headers}}
             {{#-first}}
@@ -416,17 +417,17 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 {{/producesJson}}{{#producesPlainText}}
                     let body = body.0;
                 {{/producesPlainText}}{{/vendorExtensions}}
-                    response.body(hyper::Body::from(body))
+                    response.body(Body::from(body))
             {{/dataType}}
             {{^dataType}}
-                    response.body(hyper::Body::empty())
+                    response.body(Body::empty())
             {{/dataType}}
                 },
         {{/responses}}
             }
         },
     {{/operation}}{{/operations}}{{/apis}}{{/apiInfo}}
-        _ => Ok(Response::builder().status(StatusCode::NotFound).body(hyper::Body::empty()).unwrap()),
+        _ => Ok(Response::builder().status(StatusCode::NotFound).body(Body::empty()).unwrap()),
     }
 }
 
@@ -443,7 +444,7 @@ impl<T, C> Clone for Service<T, C>
 {{#apiUsesMultipart}}
 /// Utility function to get the multipart boundary marker (if any) from the Headers.
 fn multipart_boundary<'a>(headers: &'a HashMap<String, String>) -> Option<&'a str> {
-    headers.get_typed(headers::ContentType).and_then(|content_type| {
+    headers.typed_get::<ContentType>().and_then(|content_type| {
         let mime = Mime::from(content_type);
         if mime.type_() == mime::MULTIPART && mime.subtype() == mime::FORM_DATA {
             mime.get_param(mime::BOUNDARY).map(|x| x.as_str())
@@ -457,7 +458,7 @@ fn multipart_boundary<'a>(headers: &'a HashMap<String, String>) -> Option<&'a st
 /// Request parser for `Api`.
 pub struct ApiRequestParser;
 impl RequestParser for ApiRequestParser {
-    fn parse_operation_id(request: &Request<hyper::Body>) -> Result<&'static str, ()> {
+    fn parse_operation_id(request: &Request<Body>) -> Result<&'static str, ()> {
         let path = paths::GLOBAL_REGEX_SET.matches(request.uri().path());
         match request.method() {
 {{#apiInfo}}{{#apis}}{{#operations}}{{#operation}}

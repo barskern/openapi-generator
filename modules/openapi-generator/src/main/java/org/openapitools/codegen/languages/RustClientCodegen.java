@@ -550,7 +550,7 @@ public class RustClientCodegen extends DefaultCodegen implements CodegenConfig {
         }
 
         // string
-        String enumName = sanitizeName(camelize(name));
+        String enumName = sanitizeName(camelize(name.replaceAll(" ", "_")));
         enumName = enumName.replaceFirst("^_", "");
         enumName = enumName.replaceFirst("_$", "");
 

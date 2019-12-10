@@ -91,7 +91,7 @@ impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&self, req: Request<hyper::Body>) -> Self::Future {
+    fn call(&mut self, req: Request<hyper::Body>) -> Self::Future {
         let context = A::default().push(XSpanIdString::get_or_generate(&req));
 
         {{#authMethods}}
@@ -100,8 +100,8 @@ impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext
             use headers::Authorization as HyperAuth;
             use headers::authorization::Basic;
             use std::ops::Deref;
-            if let Some(basic) = req.headers().get_typed::<HyperAuth<Basic>>().cloned() {
-                let auth_data = AuthData::Basic(basic.deref().clone());
+            if let Some(ref basic) = req.headers_mut().typed_get::<HyperAuth<Basic>>() {
+                let auth_data = AuthData::Basic(basic.0.clone());
                 let context = context.push(Some(auth_data));
                 let context = context.push(None::<Authorization>);
                 return self.inner.call((req, context));
@@ -113,8 +113,8 @@ impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext
             use headers::Authorization as HyperAuth;
             use headers::authorization::Bearer;
             use std::ops::Deref;
-            if let Some(bearer) = req.headers().get_typed::<HyperAuth<Bearer>>().cloned() {
-                let auth_data = AuthData::Bearer(bearer.deref().clone());
+            if let Some(ref bearer) = req.headers_mut().typed_get::<HyperAuth<Bearer>>(){
+                let auth_data = AuthData::Bearer(bearer.0.clone());
                 let context = context.push(Some(auth_data));
                 let context = context.push(None::<Authorization>);
                 return self.inner.call((req, context));
@@ -124,8 +124,8 @@ impl<T, A, B, C, D> hyper::service::Service<Request<hyper::Body>> for AddContext
         {{#isApiKey}}
         {{#isKeyInHeader}}
         {
-            if let Some(header) = req.headers().get_typed::<ApiKey{{-index}}>().cloned() {
-                let auth_data = AuthData::ApiKey(header.0);
+            if let Some(ref header) = req.headers_mut().typed_get::<ApiKey{{-index}}>(){
+                let auth_data = AuthData::ApiKey(header.0.clone());
                 let context = context.push(Some(auth_data));
                 let context = context.push(None::<Authorization>);
                 return self.inner.call((req, context));

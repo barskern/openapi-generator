@@ -4,7 +4,7 @@ use headers::HeaderMapExt;
 use hyper;
 use hyper::Uri;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use futures::{Stream, TryFutureExt};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use std::borrow::Cow;
 use std::io::{Read, Error, ErrorKind};
 use std::error;
@@ -29,7 +29,7 @@ use serde_xml_rs;
 #[allow(unused_imports)]
 use std::collections::{HashMap, BTreeMap};
 
-use openapi_context::{ApiError, X_SPAN_ID, XSpanIdString, Has, AuthData};
+use openapi_context::{ApiError, XSpanIdString, Has, AuthData};
 
 use crate::{
     Api
@@ -55,7 +55,7 @@ const ID_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'|');
 /// Convert input into a base path, e.g. "http://example:123". Also checks the scheme as it goes.
 fn into_base_path(input: &str, correct_scheme: Option<&'static str>) -> Result<String, ClientInitError> {
     // First convert to Uri, since a base path is a subset of Uri.
-    let uri = Uri::from_str(input)?;
+    let uri = Uri::from_str(input).map_err(ClientInitError::InvalidUri)?;
 
     let scheme = uri.scheme_str().ok_or(ClientInitError::InvalidScheme)?;
 
@@ -67,26 +67,26 @@ fn into_base_path(input: &str, correct_scheme: Option<&'static str>) -> Result<S
     }
 
     let host = uri.host().ok_or_else(|| ClientInitError::MissingHost)?;
-    let port = uri.port().map(|x| format!(":{}", x)).unwrap_or_default();
+    let port = uri.port_u16().map(|x| format!(":{}", x)).unwrap_or_default();
     Ok(format!("{}://{}{}", scheme, host, port))
 }
 
 /// A client that implements the API by making HTTP calls out to a server.
 pub struct Client<F> where
-  F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + 'static {
-    client_service: Arc<Box<dyn hyper::service::Service<hyper::Request<hyper::Body>, Response=hyper::Response<hyper::Body>, Error=hyper::Error, Future=F>>>,
+  F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + Send + 'static {
+    client_service: Arc<Box<dyn hyper::service::Service<hyper::Request<hyper::Body>, Response=hyper::Response<hyper::Body>, Error=hyper::Error, Future=F> + Send + Sync>>,
     base_path: String,
 }
 
 impl<F> fmt::Debug for Client<F> where
-   F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>>  + 'static {
+   F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + Send + 'static {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Client {{ base_path: {} }}", self.base_path)
     }
 }
 
 impl<F> Clone for Client<F> where
-   F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>>  + 'static {
+   F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + Send + 'static {
     fn clone(&self) -> Self {
         Client {
             client_service: self.client_service.clone(),
@@ -122,18 +122,16 @@ impl Client<hyper::client::ResponseFuture> {
     where
         CA: AsRef<Path>,
     {
-        let func = Box::new(|| {
-            let mut builder: native_tls::TlsConnectorBuilder = native_tls::TlsConnector::builder();
-            builder.add_root_certificate(ca_certificate);
-            let mut connector = hyper_tls::HttpsConnector::new().unwrap();
-            connector.enforce_http(false);
-            (connector, builder.build().unwrap()).into();
-        });
+        let mut builder: native_tls::TlsConnectorBuilder = native_tls::TlsConnector::builder();
+        builder.add_root_certificate(ca_certificate);
+        let mut connector = hyper_tls::HttpsConnector::new().unwrap();
+        connector.https_only(true);
+        let connector = (connector, builder.build().unwrap()).into();
 
         Self::try_new_with_connector::<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>(
             base_path,
             Some("https"),
-            func,
+            connector,
         )
     }
 
@@ -150,18 +148,16 @@ impl Client<hyper::client::ResponseFuture> {
         client_key: native_tls::Identity,
     ) -> Result<Client<hyper::client::ResponseFuture>, ClientInitError>
     {
-        let func = Box::new(|| {
-            let mut builder: native_tls::TlsConnectorBuilder = native_tls::TlsConnector::builder();
-            builder.add_root_certificate(ca_certificate);
-            builder.identity(client_key);
-            let mut connector = hyper_tls::HttpsConnector::new().unwrap();
-            connector.enforce_http(false);
-            (connector, builder.build().unwrap()).into();
-        });
+        let mut builder: native_tls::TlsConnectorBuilder = native_tls::TlsConnector::builder();
+        builder.add_root_certificate(ca_certificate);
+        builder.identity(client_key);
+        let mut connector = hyper_tls::HttpsConnector::new().unwrap();
+        connector.https_only(true);
+        let connector = (connector, builder.build().unwrap()).into();
         Self::try_new_with_connector::<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>(
             base_path,
             Some("https"),
-            func,
+            connector,
         )
     }
 
@@ -180,16 +176,15 @@ impl Client<hyper::client::ResponseFuture> {
     /// * `handle` - tokio reactor handle to use for execution
     /// * `base_path` - base path of the client API, i.e. "www.my-api-implementation.com"
     /// * `protocol` - Which protocol to use when constructing the request url, e.g. `Some("http")`
-    /// * `connector_fn` - Function which returns an implementation of `hyper::client::connect::Connect`
+    /// * `connector` - Implementation of `hyper::client::connect::Connect`
     pub fn try_new_with_connector<C>(
         base_path: &str,
         protocol: Option<&'static str>,
-        connector_fn: Box<dyn Fn() -> C + Send + Sync>,
+        connector: C,
     ) -> Result<Client<hyper::client::ResponseFuture>, ClientInitError>
     where
-        C: hyper::service::Service<hyper::client::connect::Destination>,
+        C: hyper::service::Service<hyper::client::connect::Destination, Response=(tokio_net::tcp::TcpStream, hyper::client::connect::Connected)> + Send + Sync,
     {
-        let connector = connector_fn();
         let client_service = Box::new(hyper::Client::builder().build(connector));
 
         Ok(Client {
@@ -200,7 +195,7 @@ impl Client<hyper::client::ResponseFuture> {
 }
 
 impl<F> Client<F> where
-    F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + 'static
+    F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + Send + 'static
 {
     /// Constructor for creating a `Client` by passing in a pre-made `hyper` client Service.
     ///
@@ -218,8 +213,9 @@ impl<F> Client<F> where
 
 #[async_trait]
 impl<F, C> Api<C> for Client<F> where
-    F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>>  + 'static,
-    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<AuthData>>{{/hasAuthMethods}}{
+    F: Future<Output=Result<hyper::Response<hyper::Body>, hyper::Error>> + Send + 'static,
+    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<AuthData>>{{/hasAuthMethods}} + Send + Sync + 'static
+{
 {{#apiInfo}}{{#apis}}{{#operations}}{{#operation}}
     async fn {{#vendorExtensions}}{{{operation_id}}}{{/vendorExtensions}}(&self{{#allParams}}, param_{{{paramName}}}: {{^required}}Option<{{/required}}{{#isListContainer}}&{{/isListContainer}}{{{dataType}}}{{^required}}>{{/required}}{{/allParams}}, context: &C) -> Result<{{{operationId}}}Response, ApiError> {
         let mut uri = format!(
@@ -263,7 +259,7 @@ impl<F, C> Api<C> for Client<F> where
                 {{#isKeyInHeader}}
                 &AuthData::ApiKey(ref api_key) => {
                     request.headers_mut().unwrap().typed_insert(
-                        {{#vendorExtensions}}{{x-apiKeyName}}{{/vendorExtensions}}(api_key.to_string())
+                        {{#vendorExtensions}}{{x-apiKeyName}}{{operationId}}{{/vendorExtensions}}(api_key.to_string())
                     )
                 },
                 {{/isKeyInHeader}}
@@ -278,7 +274,7 @@ impl<F, C> Api<C> for Client<F> where
             {{#isBasicBearer}}
                 &AuthData::Bearer(ref bearer_header) => {
                     request.headers_mut().unwrap().typed_insert(headers::Authorization::bearer(
-                        &bearer_header.token,
+                        bearer_header.0.token(),
                     ).map_err(|e| ApiError(format!("Failed to build request: {}", e)))?)
                 },
             {{/isBasicBearer}}
@@ -286,7 +282,7 @@ impl<F, C> Api<C> for Client<F> where
                 {{^isBasicBearer}}
                 &AuthData::Bearer(ref bearer_header) => {
                     request.headers_mut().unwrap().typed_insert(headers::Authorization::bearer(
-                        &bearer_header.token,
+                        bearer_header.0.token(),
                     ).map_err(|e| ApiError(format!("Failed to build request: {}", e)))?)
                 },
                 {{/isBasicBearer}}
@@ -302,8 +298,8 @@ impl<F, C> Api<C> for Client<F> where
 
             // Header parameters
         {{/-first}}{{^isMapContainer}}
-        {{#required}}        request.headers_mut().unwrap().typed_set(Request{{vendorExtensions.typeName}}(param_{{{paramName}}}{{#isListContainer}}.clone(){{/isListContainer}}));
-        {{/required}}{{^required}}        param_{{{paramName}}}.map(|header| request.headers().typed_set(Request{{vendorExtensions.typeName}}(header{{#isListContainer}}.clone(){{/isListContainer}})));
+        {{#required}}        request.headers_mut().unwrap().typed_insert(Request{{vendorExtensions.typeName}}(param_{{{paramName}}}{{#isListContainer}}.clone(){{/isListContainer}}));
+        {{/required}}{{^required}}        param_{{{paramName}}}.map(|header| request.headers_mut().unwrap().typed_insert(Request{{vendorExtensions.typeName}}(header{{#isListContainer}}.clone(){{/isListContainer}})));
         {{/required}}{{/isMapContainer}}{{#isMapContainer}}                let param_{{{paramName}}}: Option<{{{dataType}}}> = None;
     {{/isMapContainer}}
     {{/headerParams}}
@@ -327,7 +323,7 @@ impl<F, C> Api<C> for Client<F> where
 
         let {{{paramName}}}_vec = {{{paramName}}}_str.as_bytes().to_vec();
 
-        let {{{paramName}}}_mime = Mime::from_str("application/json").expect("impossible to fail to parse");
+        let {{{paramName}}}_mime = mime_02::Mime::from_str("application/json").expect("impossible to fail to parse");
 
         let {{{paramName}}}_cursor = Cursor::new({{{paramName}}}_vec);
 
@@ -339,7 +335,7 @@ impl<F, C> Api<C> for Client<F> where
 
         let {{{paramName}}}_vec = param_{{{paramName}}}.to_vec();
 
-        let {{{paramName}}}_mime = Mime::from_str("application/octet-stream") {
+        let {{{paramName}}}_mime = mime_02::Mime::from_str("application/octet-stream") {
             Ok(mime) => mime,
             Err(err) => return Err(ApiError(format!("Unable to get mime type: {:?}", err))),
         };
@@ -369,7 +365,7 @@ impl<F, C> Api<C> for Client<F> where
             Err(err) => return Err(ApiError(format!("Unable to build multipart header: {:?}", err))),
         };
 
-        request.headers().typed_set(headers::ContentType::from(multipart_header));
+        request.headers_mut().unwrap().typed_insert(headers::ContentType::from(multipart_header));
         let body = hyper::Body::from(body_string);
 
     {{/consumesMultipart}}
@@ -389,7 +385,7 @@ impl<F, C> Api<C> for Client<F> where
         ];
         let body = serde_urlencoded::to_string(params).expect("impossible to fail to serialize");
 
-        request.headers().typed_set(headers::ContentType::from(mimetypes::requests::{{#vendorExtensions}}{{{uppercase_operation_id}}}{{/vendorExtensions}}.clone()));
+        request.headers_mut().unwrap().typed_insert(headers::ContentType::from(mimetypes::requests::{{#vendorExtensions}}{{{uppercase_operation_id}}}{{/vendorExtensions}}.clone()));
         let body = hyper::Body::from(body);
         {{/-last}}
       {{/formParams}}
@@ -451,12 +447,12 @@ impl<F, C> Api<C> for Client<F> where
 {{#responses}}
             {{{code}}} => {
 {{#headers}}
-                let response_{{{name}}} = match response.headers().get::<Response{{{nameInCamelCase}}}>() {
+                let response_{{{name}}} = match response.headers().typed_get::<Response{{{nameInCamelCase}}}>() {
                     Some(response_{{{name}}}) => response_{{{name}}}.0.clone(),
                     None => return Err(ApiError(String::from("Required response header {{{baseName}}} for response {{{code}}} was not found."))),
                 };
 {{/headers}}
-                let result: Result<Vec<_>, _> = crate::body_as_stream(response.body())
+                let result: Result<Vec<_>, _> = crate::body_as_stream(response.into_body())
                     .try_collect()
                     .await;
                 let body = result.map_err(|e| ApiError(format!("Failed to read response: {}", e)))?;
@@ -465,7 +461,8 @@ impl<F, C> Api<C> for Client<F> where
 {{#producesPlainText}}
                 Ok(openapi_context::ByteArray(body.to_vec()))
 {{/producesPlainText}}{{^producesPlainText}}
-                let body = str::from_utf8(&body)
+                let bytes: Vec<_> = body.into_iter().map(|c| c.into_bytes()).flatten().collect();
+                let body = str::from_utf8(bytes.as_slice())
                     .map_err(|e| ApiError(format!("Response was not valid UTF8: {}", e)))?;
 {{#producesXml}}
                 // ToDo: this will move to swagger-rs and become a standard From conversion trait
@@ -474,7 +471,7 @@ impl<F, C> Api<C> for Client<F> where
                     .map_err(|e| ApiError(format!("Response body did not match the schema: {}", e)))?;
 {{/producesXml}}{{#producesJson}}
                 let body = serde_json::from_str::<{{{dataType}}}>(body)
-                    .map_err(|e| e.into())?;
+                    .map_err(ApiError::from)?;
 {{/producesJson}}
 {{/producesPlainText}}{{/vendorExtensions}}
                         Ok({{{operationId}}}Response::{{#vendorExtensions}}{{x-responseId}}{{/vendorExtensions}}{{^headers}}(body){{/headers}}{{#headers}}{{#-first}}{ body: body, {{/-first}}{{{name}}}: response_{{{name}}}{{^-last}}, {{/-last}}{{#-last}} }{{/-last}}{{/headers}})
@@ -496,19 +493,22 @@ impl<F, C> Api<C> for Client<F> where
 {{/responses}}
             code => {
                 let headers = response.headers().clone();
-                let result: Result<Vec<_>, _> = crate::body_as_stream(response.body())
+                let result: Result<Vec<_>, _> = crate::body_as_stream(response.into_body())
                     .take(100)
                     .try_collect()
                     .await;
                 Err(ApiError(format!("Unexpected response code {}:\n{:?}\n\n{}",
                     code,
                     headers,
-                    match body {
-                        Ok(ref body) => match str::from_utf8(body) {
-                            Ok(body) => Cow::from(body),
-                            Err(e) => Cow::from(format!("<Body was not UTF8: {:?}>", e)),
+                    match result {
+                        Ok(ref body) => {
+                            let bytes: Vec<_> = body.into_iter().map(|c| c.into_bytes()).flatten().collect();
+                            match str::from_utf8(bytes.as_slice()) {
+                                Ok(body) => body.to_owned(),
+                                Err(e) => format!("<Body was not UTF8: {:?}>", e),
+                            }
                         },
-                        Err(e) => Cow::from(format!("<Failed to read body: {}>", e)),
+                        Err(e) => format!("<Failed to read body: {}>", e),
                     })))
             }
         }
@@ -519,13 +519,13 @@ impl<F, C> Api<C> for Client<F> where
 #[derive(Debug)]
 pub enum ClientInitError {
     InvalidScheme,
-    InvalidUri(hyper::Error),
+    InvalidUri(http::uri::InvalidUri),
     MissingHost,
     SslError(native_tls::Error),
 }
 
-impl From<hyper::Error> for ClientInitError {
-    fn from(err: hyper::Error) -> ClientInitError {
+impl From<http::uri::InvalidUri> for ClientInitError {
+    fn from(err: http::uri::InvalidUri) -> ClientInitError {
         ClientInitError::InvalidUri(err)
     }
 }

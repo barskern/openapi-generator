@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use futures::{future, FutureExt, Stream, stream, TryStreamExt};
 use headers::{ContentType, HeaderMapExt};
 use hyper;
-use hyper::{Body, Request, Response, Error, StatusCode};
+use hyper::{Body, HeaderMap, Request, Response, StatusCode};
 use lazy_static::lazy_static;
 use log::*;
 use url::form_urlencoded;
@@ -14,7 +14,7 @@ use mime::Mime;
 {{#apiUsesMultipart}}
 use multipart::server::Multipart;
 use multipart::server::save::SaveResult;
-use std::fs;
+use std::io::Read;
 {{/apiUsesMultipart}}
 use serde_json;
 {{#usesXml}}
@@ -29,7 +29,7 @@ use std::io;
 use std::collections::BTreeSet;
 
 pub use openapi_context::auth::Authorization;
-use openapi_context::{ApiError, X_SPAN_ID, XSpanIdString, Has, RequestParser};
+use openapi_context::{ApiError, XSpanIdString, Has, RequestParser};
 use openapi_context::auth::Scopes;
 
 use crate::{
@@ -75,8 +75,8 @@ pub struct Service<T, C> {
 
 impl<T, C> Service<T, C>
 where
-    T: Api<C> + Clone + 'static,
-    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<Authorization>>{{/hasAuthMethods}} + 'static {
+    T: Api<C> + Send + Sync + Clone + 'static,
+    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<Authorization>>{{/hasAuthMethods}} + Send + Sync + 'static {
     pub fn new<U: Into<Arc<T>>>(api_impl: U) -> Service<T, C> {
         Service{api_impl: api_impl.into(), marker: PhantomData}
     }
@@ -86,25 +86,32 @@ pub type ServiceRequest<C> = (Request<Body>, C);
 pub type ServiceResponse = Response<Body>;
 impl<T, C> hyper::service::Service<ServiceRequest<C>> for Service<T, C>
 where
-    T: Api<C> + Clone + 'static,
-    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<Authorization>>{{/hasAuthMethods}} + 'static
+    T: Api<C> + Send + Sync + Clone + 'static,
+    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<Authorization>>{{/hasAuthMethods}} + Send + Sync + 'static
 {
-    type Response = Body;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output=Result<ServiceResponse, Error>>>>;
+    type Response = ServiceResponse;
+    type Error = ApiError;
+    type Future = Pin<Box<dyn Future<Output=Result<Self::Response, Self::Error>> + Send + Sync>>;
 
     fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&self, r: ServiceRequest<C>) -> Self::Future {
+    fn call(&mut self, r: ServiceRequest<C>) -> Self::Future {
         do_call(self.api_impl.clone(), r).boxed()
     }
 }
 
-async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceResponse, Error> {
+async fn do_call<T, C>(api_impl: Arc<T>, r: ServiceRequest<C>) -> Result<ServiceResponse, ApiError>
+where
+    T: Api<C> + Send + Sync + Clone + 'static,
+    C: Has<XSpanIdString> {{#hasAuthMethods}}+ Has<Option<Authorization>>{{/hasAuthMethods}} + Send + Sync + 'static
+{
     let (req, mut context) = r;
-    let (method, uri, _, headers, body) = req.deconstruct();
+    let (parts, body) = req.into_parts();
+    let uri = parts.uri;
+    let method = parts.method;
+    let headers = parts.headers;
     let path = paths::GLOBAL_REGEX_SET.matches(uri.path());
 
     // This match statement is duplicated below in `parse_operation_id()`.
@@ -116,7 +123,7 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
         {{#hasAuthMethods}}
             let authorization = match (&context as &dyn Has<Option<Authorization>>).get() {
                 &Some(ref authorization) => authorization,
-                &None => return Ok(Response::builder().status(StatusCode::Forbidden).body(hyper::Body::from("Unauthenticated")).unwrap()),
+                &None => return Ok(Response::builder().status(StatusCode::FORBIDDEN).body(hyper::Body::from("Unauthenticated")).unwrap()),
             };
 
             {{#authMethods}}
@@ -132,11 +139,12 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 if !required_scopes.is_subset(scopes) {
                     let missing_scopes = required_scopes.difference(scopes);
                     return Ok(Response::builder()
-                        .status(StatusCode::Forbidden)
+                        .status(StatusCode::FORBIDDEN)
                         .body(hyper::Body::from(missing_scopes.fold(
                             "Insufficient authorization, missing scopes".to_string(),
                             |s, scope| format!("{} {}", s, scope)
-                        ))).unwrap());
+                        ))).unwrap())
+                    ;
                 }
             }
                 {{/isOAuth}}
@@ -146,7 +154,7 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             {{#consumesMultipart}}
             let boundary = match multipart_boundary(&headers) {
                 Some(boundary) => boundary.to_string(),
-                None => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from("Couldn't find valid multipart body")).unwrap()),
+                None => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from("Couldn't find valid multipart body")).unwrap()),
             };
             {{/consumesMultipart}}
             {{#hasPathParams}}
@@ -163,9 +171,9 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             let param_{{{paramName}}} = match percent_encoding::percent_decode(path_params["{{{baseName}}}"].as_bytes()).decode_utf8() {
                 Ok(param_{{{paramName}}}) => match param_{{{paramName}}}.parse::<{{{dataType}}}>() {
                     Ok(param_{{{paramName}}}) => param_{{{paramName}}},
-                    Err(e) => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Couldn't parse path parameter {{{baseName}}}: {:?}", e))).unwrap()),
+                    Err(e) => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("Couldn't parse path parameter {{{baseName}}}: {:?}", e))).unwrap()),
                 },
-                Err(_) => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Couldn't percent-decode path parameter as UTF-8: {}", &path_params["{{{baseName}}}"]))).unwrap())
+                Err(_) => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("Couldn't percent-decode path parameter as UTF-8: {}", &path_params["{{{baseName}}}"]))).unwrap())
             };
         {{/pathParams}}
         {{#headerParams}}
@@ -175,11 +183,11 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             {{#required}}
             let param_{{{paramName}}} = match headers.typed_get(Request{{vendorExtensions.typeName}}) {
                 Some(param_{{{paramName}}}) => param_{{{paramName}}}.0.clone(),
-                None => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from("Missing or invalid required header {{{baseName}}}"))).unwrap()),
+                None => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from("Missing or invalid required header {{{baseName}}}"))).unwrap()),
             };
             {{/required}}
             {{^required}}
-            let param_{{{paramName}}} = headers.get::<Request{{vendorExtensions.typeName}}>().map(|header| header.0.clone());
+            let param_{{{paramName}}} = headers.typed_get::<Request{{vendorExtensions.typeName}}>().map(|header| header.0.clone());
             {{/required}}
         {{/headerParams}}
         {{#queryParams}}
@@ -205,9 +213,9 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             let param_{{{paramName}}} = match param_{{{paramName}}} {
                 Some(param_{{{paramName}}}) => match param_{{{paramName}}}.parse::<{{{dataType}}}>() {
                     Ok(param_{{{paramName}}}) => param_{{{paramName}}},
-                    Err(e) => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Couldn't parse query parameter {{{baseName}}} - doesn't match schema: {}", e))).unwrap()),
+                    Err(e) => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("Couldn't parse query parameter {{{baseName}}} - doesn't match schema: {}", e))).unwrap()),
                 },
-                None => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from("Missing required query parameter {{{baseName}}}")).unwrap()),
+                None => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from("Missing required query parameter {{{baseName}}}")).unwrap()),
             };
                 {{/required}}
                 {{^required}}
@@ -223,22 +231,31 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             // values, rather than causing a 400 response). Produce warning header and logs for
             // any unused fields
 
-            let result: Result<Vec<_>, _> = body
+            let result: Result<Vec<_>, _> = crate::body_as_stream(body)
                 .try_collect()
                 .await;
-            let body = result.unwrap_or_else(|e| {
-                return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Couldn't receive body parameter body: {}", e))).unwrap())
-            });
+            let body = match result {
+                Err(e) => {
+                    return Ok(
+                        Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(hyper::Body::from(format!("Couldn't receive body parameter body: {}", e)))
+                            .unwrap()
+                    );
+                }
+                Ok(v) => v,
+            };
+            let bytes: Vec<_> = body.into_iter().map(|c| c.into_bytes()).flatten().collect();
                         {{#vendorExtensions}}
                             {{^consumesPlainText}}
             let mut unused_elements = Vec::new();
                             {{/consumesPlainText}}
             let param_{{{paramName}}}: Option<{{{dataType}}}> = if !body.is_empty() {
                             {{#consumesXml}}
-                let deserializer = &mut serde_xml_rs::de::Deserializer::new_from_reader(&*body);
+                let deserializer = &mut serde_xml_rs::de::Deserializer::new_from_reader(bytes.as_slice());
                             {{/consumesXml}}
                             {{#consumesJson}}
-                let deserializer = &mut serde_json::Deserializer::from_slice(&*body);
+                let deserializer = &mut serde_json::Deserializer::from_slice(bytes.as_slice());
                             {{/consumesJson}}
                             {{^consumesPlainText}}
                 match serde_ignored::deserialize(deserializer, |path| {
@@ -247,7 +264,7 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 }) {
                     Ok(param_{{{paramName}}}) => param_{{{paramName}}},
                                 {{#required}}
-                    Err(e) => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Couldn't parse body parameter {{{baseName}}} - doesn't match schema: {}", e))).unwrap()),
+                    Err(e) => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("Couldn't parse body parameter {{{baseName}}} - doesn't match schema: {}", e))).unwrap()),
                                 {{/required}}
                                 {{^required}}
                     Err(_) => None,
@@ -256,10 +273,10 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                             {{/consumesPlainText}}
                             {{#consumesPlainText}}
                                 {{#isByteArray}}
-                Some(openapi_context::ByteArray(body.to_vec()))
+                Some(openapi_context::ByteArray(bytes))
                                 {{/isByteArray}}
                                 {{#isString}}
-                Some(String::from_utf8(body.to_vec()).unwrap())
+                Some(String::from_utf8(bytes).unwrap())
                                 {{/isString}}
                             {{/consumesPlainText}}
             } else {
@@ -269,7 +286,7 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                         {{#required}}
             let param_{{{paramName}}} = match param_{{{paramName}}} {
                 Some(param_{{{paramName}}}) => param_{{{paramName}}},
-                None => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from("Missing required body parameter {{{baseName}}}")).unwrap()),
+                None => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from("Missing required body parameter {{{baseName}}}")).unwrap()),
             };
                         {{/required}}
                     {{/-first}}
@@ -281,67 +298,81 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             // Form Body parameters (note that non-required body parameters will ignore garbage
             // values, rather than causing a 400 response). Produce warning header and logs for
             // any unused fields.
-            let result: Result<Vec<_>, _> = body
+            let result: Result<Vec<_>, _> = crate::body_as_stream(body)
                 .try_collect()
                 .await;
-            let body = result.unwrap_or_else(|e| {
-                return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Couldn't receive body parameter body: {}", e))).unwrap())
-            });
+            let body = match result {
+                Err(e) => {
+                    return Ok(
+                        Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(hyper::Body::from(format!("Couldn't receive body parameter body: {}", e)))
+                            .unwrap()
+                    );
+                }
+                Ok(v) => v,
+            };
+            let bytes: Vec<_> = body.into_iter().map(|c| c.into_bytes()).flatten().collect();
             // Read Form Parameters from body
-            let mut entries = match Multipart::with_body(&body.to_vec()[..], boundary).save().temp() {
+            let mut reader = std::io::Cursor::new(bytes);
+            let mut entries = match Multipart::with_body(reader, boundary).save().temp() {
                 SaveResult::Full(entries) => {
                     entries
                 },
                 _ => {
-                    return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Unable to process all message parts"))).unwrap())
+                    return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("Unable to process all message parts"))).unwrap())
                 },
             };
                         {{#formParams}}{{#-first}}{{/-first}}
                             {{#isByteArray}}
-            let file_{{{paramName}}} = entries.files.remove("{{{paramName}}}");
+            let file_{{{paramName}}} = entries.fields.remove("{{{paramName}}}");
                                 {{#required}}
             let param_{{{paramName}}} = match file_{{{paramName}}} {
                 Some(file) => {
-                    let path = &file[0].path;
-                    let {{{paramName}}}_str = fs::read_to_string(path).unwrap();
-                    openapi_context::ByteArray({{{paramName}}}_str.as_bytes().to_vec())
+                    let mut reader = file[0].data.readable().unwrap();
+                    let mut {{{paramName}}}_bytes = vec![];
+                    reader.read_to_end(&mut {{{paramName}}}_bytes).unwrap();
+                    openapi_context::ByteArray({{{paramName}}}_bytes)
                 }
-                None => return Ok(Response::new().status(StatusCode::BadRequest).body(format!("Missing required form parameter {{{paramName}}}")).unwrap()),
+                None => return Ok(Response::new().status(StatusCode::BAD_REQUEST).body(format!("Missing required form parameter {{{paramName}}}")).unwrap()),
             };
                                 {{/required}}{{^required}}
             let param_{{{paramName}}} = match file_{{{paramName}}} {
                 Some(file) => {
-                    let path = &file[0].path;
-                    let {{{paramName}}}_str = fs::read_to_string(path).unwrap();
-                    Some(openapi_context::ByteArray({{{paramName}}}_str.as_bytes().to_vec()))
+                    let mut reader = file[0].data.readable().unwrap();
+                    let mut {{{paramName}}}_bytes = vec![];
+                    reader.read_to_end(&mut {{{paramName}}}_bytes).unwrap();
+                    Some(openapi_context::ByteArray({{{paramName}}}_bytes))
                 }
                 None => None,
             };
                             {{/required}}
                             {{/isByteArray}}
                             {{^isByteArray}}{{#jsonSchema}}
-            let file_{{{paramName}}} = entries.files.remove("{{{paramName}}}");
+            let file_{{{paramName}}} = entries.fields.remove("{{{paramName}}}");
                                 {{#required}}
             let param_{{{paramName}}} = match file_{{{paramName}}} {
                 Some(file) => {
-                    let path = &file[0].path;
-                    let {{{paramName}}}_str = fs::read_to_string(path).expect("Reading saved String should never fail");
-                    let {{{paramName}}}_model: {{{dataType}}} = match serde_json::from_str(&{{{paramName}}}_str) {
+                    let mut reader = file[0].data.readable().unwrap();
+                    let mut {{{paramName}}}_bytes = vec![];
+                    reader.read_to_end(&mut {{{paramName}}}_bytes).unwrap();
+                    let {{{paramName}}}_model: {{{dataType}}} = match serde_json::from_slice(&{{{paramName}}}_bytes.as_slice()) {
                         Ok(model) => model,
                         Err(e) => {
-                            return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("{{{paramName}}} data does not match API definition: {}", e))).unwrap())
+                            return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("{{{paramName}}} data does not match API definition: {}", e))).unwrap())
                         }
                     };
                     {{{paramName}}}_model
                 }
-                None => return Ok(Response::builder().status(StatusCode::BadRequest).body(hyper::Body::from(format!("Missing required form parameter {{{paramName}}}"))).unwrap()),
+                None => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(hyper::Body::from(format!("Missing required form parameter {{{paramName}}}"))).unwrap()),
             };
                                 {{/required}}{{^required}}
             let param_{{{paramName}}} = match file_{{{paramName}}} {
                 Some(file) => {
-                    let path = &file[0].path;
-                    let {{{paramName}}}_str = fs::read_to_string(path).unwrap();
-                    let {{{paramName}}}_model: {{{dataType}}} = serde_json::from_str(&{{{paramName}}}_str).expect("Impossible to fail to serialise");
+                    let mut reader = file[0].data.readable().unwrap();
+                    let mut {{{paramName}}}_bytes = vec![];
+                    reader.read_to_end(&mut {{{paramName}}}_bytes).unwrap();
+                    let {{{paramName}}}_model: {{{dataType}}} = serde_json::from_slice(&{{{paramName}}}_bytes.as_slice()).expect("Impossible to fail to serialize");
                     Some({{{paramName}}}_model)
                 }
                 None => None,
@@ -368,16 +399,19 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
             let result = api_impl.{{#vendorExtensions}}{{{operation_id}}}{{/vendorExtensions}}({{#allParams}}param_{{{paramName}}}{{#isListContainer}}.as_ref(){{/isListContainer}}, {{/allParams}}&context).await;
             let mut response = Response::builder();
             response.header("X-Span-Id", (&context as &dyn Has<XSpanIdString>).get().0.to_string());
+            let result = match result {
+                Err(e) => {
+                    // Application code returned an error. This should not happen, as the implementation should
+                    // return a valid response.
+                    response.status(StatusCode::INTERNAL_SERVER_ERROR);
+                    return Ok(response.body(hyper::Body::from("An internal error occurred")).unwrap());
+                }
+                Ok(r) => r,
+            };
         {{#bodyParams}}{{#vendorExtensions}}{{^consumesPlainText}}
             if !unused_elements.is_empty() {
-                response.headers().typed_insert(Warning(format!("Ignoring unknown fields in body: {:?}", unused_elements)));
+                response.headers_mut().unwrap().typed_insert(Warning(format!("Ignoring unknown fields in body: {:?}", unused_elements)));
             }
-            let rsp = result.unwrap_or_else(|e| {
-                // Application code returned an error. This should not happen, as the implementation should
-                // return a valid response.
-                response.status(StatusCode::InternalServerError);
-                return Ok(response.body(hyper::Body::from("An internal error occurred")).unwrap());
-            });
         {{/consumesPlainText}}{{/vendorExtensions}}{{/bodyParams}}
             match result {
         {{#responses}}
@@ -398,11 +432,11 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 => {
                     response.status(hyper::http::StatusCode::from_u16({{{code}}}).unwrap());
             {{#headers}}
-                    response.headers().typed_insert(Response{{{nameInCamelCase}}}({{{name}}}));
+                    response.headers_mut().unwrap().typed_insert(Response{{{nameInCamelCase}}}({{{name}}}));
             {{/headers}}
             {{#produces}}{{#-first}}{{#dataType}}
                     let header = headers::ContentType::from(mimetypes::responses::{{#vendorExtensions}}{{{uppercase_operation_id}}}_{{x-uppercaseResponseId}}{{/vendorExtensions}}.clone());
-                    response.header(header);
+                    response.headers_mut().unwrap().typed_insert(header);
             {{/dataType}}{{/-first}}{{/produces}}
             {{#dataType}}
                 {{#vendorExtensions}}{{#producesXml}}{{^has_namespace}}
@@ -417,17 +451,17 @@ async fn do_call<T, C>(api_impl: T, r: ServiceRequest<C>) -> Result<ServiceRespo
                 {{/producesJson}}{{#producesPlainText}}
                     let body = body.0;
                 {{/producesPlainText}}{{/vendorExtensions}}
-                    response.body(Body::from(body))
+                    Ok(response.body(Body::from(body)).unwrap())
             {{/dataType}}
             {{^dataType}}
-                    response.body(Body::empty())
+                    Ok(response.body(Body::empty()).unwrap())
             {{/dataType}}
                 },
         {{/responses}}
             }
         },
     {{/operation}}{{/operations}}{{/apis}}{{/apiInfo}}
-        _ => Ok(Response::builder().status(StatusCode::NotFound).body(Body::empty()).unwrap()),
+        _ => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()),
     }
 }
 
@@ -443,7 +477,7 @@ impl<T, C> Clone for Service<T, C>
 
 {{#apiUsesMultipart}}
 /// Utility function to get the multipart boundary marker (if any) from the Headers.
-fn multipart_boundary<'a>(headers: &'a HashMap<String, String>) -> Option<&'a str> {
+fn multipart_boundary<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
     headers.typed_get::<ContentType>().and_then(|content_type| {
         let mime = Mime::from(content_type);
         if mime.type_() == mime::MULTIPART && mime.subtype() == mime::FORM_DATA {
@@ -457,7 +491,7 @@ fn multipart_boundary<'a>(headers: &'a HashMap<String, String>) -> Option<&'a st
 
 /// Request parser for `Api`.
 pub struct ApiRequestParser;
-impl RequestParser for ApiRequestParser {
+impl RequestParser<Body> for ApiRequestParser {
     fn parse_operation_id(request: &Request<Body>) -> Result<&'static str, ()> {
         let path = paths::GLOBAL_REGEX_SET.matches(request.uri().path());
         match request.method() {

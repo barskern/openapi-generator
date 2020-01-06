@@ -18,6 +18,17 @@ pub enum {{classname}} {
     {{name}},
 {{/enumVars}}{{/allowableValues}}
 }
+
+impl std::string::ToString for {{classname}} {
+    fn to_string(&self) -> String {
+        match self {
+        {{#allowableValues}}{{#enumVars}}
+            Self::{{name}} => "{{{value}}}".to_string(),
+        {{/enumVars}}{{/allowableValues}}
+        }
+    }
+}
+
 {{/isEnum}}
 
 {{!-- for schemas that have a discriminator --}}

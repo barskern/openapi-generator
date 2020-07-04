@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 {{!-- for enum schemas --}}
 {{#isEnum}}
 /// {{{description}}}
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum {{classname}} {
 {{#allowableValues}}
 {{#enumVars}}
@@ -33,7 +33,7 @@ impl std::string::ToString for {{classname}} {
 
 {{!-- for schemas that have a discriminator --}}
 {{#discriminator}}
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "{{{vendorExtensions.tagName}}}")]
 pub enum {{classname}} {
 {{#vendorExtensions}}
@@ -57,7 +57,7 @@ pub enum {{classname}} {
 {{!-- for non-enum schemas --}}
 {{^isEnum}}
 {{^discriminator}}
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct {{{classname}}} {
 {{#vars}}
     {{#description}}
@@ -87,7 +87,7 @@ impl {{{classname}}} {
 {{#vars}}
 {{#isEnum}}
 /// {{{description}}}
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum {{enumName}} {
 {{#allowableValues}}
 {{#enumVars}}
